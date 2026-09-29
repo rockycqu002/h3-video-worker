@@ -50,8 +50,8 @@ def base_env(extra_hosts=()):
         "R2_ACCESS_KEY_ID": "{{ RUNPOD_SECRET_h3_r2_access_key_id }}",
         "R2_SECRET_ACCESS_KEY": "{{ RUNPOD_SECRET_h3_r2_secret_access_key }}",
         "FRAME_URL_ALLOW": ",".join(hosts),
-        "H3_COMFY_ARGS": "--reserve-vram 1 --disable-nvml-pressure",
-        "H3_JOB_DEADLINE_S": "840",
+        "H3_COMFY_ARGS": "--reserve-vram 1 --disable-nvml-pressure --fast-disk",
+        "H3_JOB_DEADLINE_S": "1740",
         "H3_PREFETCH": "1",
     }
 
@@ -73,7 +73,7 @@ def create(a):
         "minCudaVersion": "13.0", "dataCenterIds": list(VOLUMES),
         # single region: networkVolumeId; multi-region needs networkVolumeIds as a list of objects (schema NetworkVolumeIdsInput)
         "networkVolumeId": next(iter(VOLUMES.values())),
-        "workersMin": 0, "workersMax": a.max_workers, "idleTimeout": a.idle, "executionTimeoutMs": 900000,
+        "workersMin": 0, "workersMax": a.max_workers, "idleTimeout": a.idle, "executionTimeoutMs": 1800000,   # 15 s clips generate for ~17 min
         "flashboot": True, "scalerType": "REQUEST_COUNT", "scalerValue": 1})
     print("endpoint:", ep.get("id"))
     show(argparse.Namespace(endpoint=ep["id"]))

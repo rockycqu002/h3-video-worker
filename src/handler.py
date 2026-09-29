@@ -32,9 +32,11 @@ MODEL_FILES = ["text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
                "vae/minimax_h3_video_vae_fp16.safetensors",
                "vae/minimax_h3_audio_vae_fp32.safetensors"]
 H3IR_BIN = os.environ.get("H3IR_BIN", "/opt/h3ir/bin/h3ir")
-COMFY_EXTRA_ARGS = shlex.split(os.environ.get("H3_COMFY_ARGS", "--reserve-vram 1 --disable-nvml-pressure"))
+# --fast-disk: dynamic VRAM loads weights disk-backed instead of keeping ~37 GB of CPU copies in process memory. RunPod 4090
+# workers get a 43,869 MiB cgroup limit; without it 10 s clips were OOM-killed in VAE decode (docs/TEST_REPORT.md). No speed cost.
+COMFY_EXTRA_ARGS = shlex.split(os.environ.get("H3_COMFY_ARGS", "--reserve-vram 1 --disable-nvml-pressure --fast-disk"))
 BUILD = os.environ.get("H3_BUILD", "dev")
-JOB_DEADLINE_S = float(os.environ.get("H3_JOB_DEADLINE_S", 840))     # stay under the endpoint executionTimeout (900 s)
+JOB_DEADLINE_S = float(os.environ.get("H3_JOB_DEADLINE_S", 1740))    # stay under the endpoint executionTimeout (1800 s); 15 s clips take ~17 min
 COMFY_BOOT_S = float(os.environ.get("H3_COMFY_BOOT_S", 300))
 COMFY_SILENT_S = float(os.environ.get("H3_COMFY_SILENT_S", 180))  # tolerated HTTP silence from a live ComfyUI mid-generation
 PREFETCH = os.environ.get("H3_PREFETCH", "1") == "1"

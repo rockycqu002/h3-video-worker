@@ -41,8 +41,8 @@ POST https://api.runpod.ai/v2/<ENDPOINT_ID>/run
 | `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | output bucket; token scoped to that bucket (secrets) |
 | `R2_PREFIX` | default `videos` |
 | `FRAME_URL_ALLOW` | comma-separated keyframe hosts; `.example.com` also matches subdomains |
-| `H3_COMFY_ARGS` | ComfyUI flags, default `--reserve-vram 1 --disable-nvml-pressure` |
-| `H3_JOB_DEADLINE_S` | default 840 (endpoint executionTimeout 900 s) |
+| `H3_COMFY_ARGS` | ComfyUI flags, default `--reserve-vram 1 --disable-nvml-pressure --fast-disk` (`--fast-disk` is required on RunPod 4090s: 43.9 GB RAM limit) |
+| `H3_JOB_DEADLINE_S` | default 1740 (endpoint executionTimeout 1800 s) |
 | `H3_PREFETCH` | `1` (default) reads the weights into the page cache at boot |
 
 ## Local checks

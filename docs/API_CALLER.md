@@ -17,13 +17,13 @@ RunPod API key、R2 凭据只能放在 Worker 的 secret 里，不能下发到�
 | 调用模式 | 队列式：`POST /run` 提交（带 `webhook`）；`GET /status/{id}` 兜底查询。**不要用 `/runsync`**（任务要几分钟） |
 | GPU / 模型 | RTX 4090 24 GB · MiniMax H3 DaSiWa Hybrid 8 步 · 24 fps · 视频 + 立体声音频 |
 | 机房 | US-CA-2（权重所在 Network Volume 的机房） |
-| 单条耗时（5 s @ 1344×768，worker 已热） | 生成 170–200 s + 改写 7–30 s ≈ **3–4 分钟** |
-| 冷启动（没有热 worker） | 额外排队 26–160 s（2026-09-29 实测：首次 162 s，之后 26 s） |
-| 时长与耗时 | 生成时间大致随帧数线性增长：10 s ≈ 2×，15 s ≈ 3×（未实测，按帧数估） |
-| 执行超时 | 900 s（worker 在 840 s 主动中止并返回 `generate_timeout`） |
+| 单条耗时（1344×768，worker 已热，实测） | 生成：5 s → 166–171 s；8 s → 326–331 s；10 s → 510–528 s；15 s → 1009 s（**约 17 分钟**），另加改写 7–30 s |
+| 冷启动（没有热 worker） | 额外排队约 10 s–5 min（实测 9.9 s / 26 s / 162 s / 291 s，取决于主机是否已缓存镜像）。首单还要从 Network Volume 读权重，个别主机读盘很慢（42 GB 读了 548 s） |
+| 时长与耗时 | **超线性**：8 s ≈ 2×、10 s ≈ 3×、15 s ≈ 6× 的 5 s 耗时（注意力计算随长度平方增长）。前端应按时长给出不同的预计等待时间 |
+| 执行超时 | 1800 s（worker 在 1740 s 主动中止并返回 `generate_timeout`）。15 s 视频正常需要约 17–20 分钟 |
 | 结果保留 | `/run` 的结果在 RunPod 侧保留约 **30 分钟**；视频本身在 R2，不受影响 |
 | 扩缩容 | 0–N 个 worker（测试 endpoint N=1），每个 worker 同时只跑 1 个任务，多余请求排队 |
-| 成本（估算） | 4090 serverless 按秒计费 ≈ $0.000306/s（$1.10/h，取自本账户 qwen 4090 endpoint 的实际账单），含冷启动与 60 s 空闲保温。5 s 视频：连续请求 ≈ $0.06/条；零散请求（冷启动 + 保温）≈ $0.09/条；最坏 ≈ $0.15。改写（OpenRouter）< $0.01。以 RunPod 账单为准 |
+| 成本（按实测耗时 × 实际费率） | 4090 serverless ≈ $0.000306/s（$1.10/h，取自本账户 qwen 4090 endpoint 的实际账单），含冷启动与 60 s 空闲保温。worker 已热时每条：**5 s ≈ $0.055、8 s ≈ $0.10、10 s ≈ $0.16、15 s ≈ $0.31**；零散请求每条再加 ≈ $0.03（冷启动 + 保温）。改写（OpenRouter）< $0.01。以 RunPod 账单为准 |
 
 ---
 
@@ -50,7 +50,7 @@ Content-Type: application/json
 | `input.request` | 是 | string | — | 用户的自然语言需求，中英文均可，≤ 6000 字符。`skip_rewrite=true` 时视为**最终 H3 prompt** 原样送入模型 |
 | `input.skip_rewrite` | 否 | bool | `false` | 跳过自动改写。仅给懂 H3 prompt 格式的高级用户 / 内部调试 |
 | `input.creativity` | 否 | string | `balanced` | 改写的发挥程度：`restrained` / `balanced` / `bold` / `extreme`。`bold` 以上会自行添加画面元素 |
-| `input.seconds` | 否 | number | `5` | 4–15。实际帧数 = 对齐到 H3 的 17k+5 网格（5 s → 124 帧，15 s → 362 帧） |
+| `input.seconds` | 否 | number | `5` | 4–15。实际帧数 = 对齐到 H3 的 17k+5 网格（5 s → 124 帧，15 s → 362 帧）。耗时和成本随时长超线性增长（见 §1），建议按时长分档计费 |
 | `input.aspect` | 否 | string | `auto` | `auto` / `21:9` / `16:9` / `4:3` / `1:1` / `3:4` / `9:16`。`auto`：有关键帧则跟随关键帧比例，否则 16:9 |
 | `input.quality` | 否 | string | `768` | 短边像素：`768` / `640` / `544` / `416`（长边上限 1344）。越小越快 |
 | `input.seed` | 否 | int | 随机 | 0–2^53；实际值在 `output.seed` 返回 |
@@ -131,7 +131,7 @@ Content-Type: application/json
 | `rewrite_failed` | 改写失败（OpenRouter 不可用 / 额度不足 / 模型输出不合格，已重试 3 次） | 可重试 1 次，或提示用户稍后再试 | 是 |
 | `comfy_rejected` | 模型执行报错 | 可重试 1 次 | 是 |
 | `oom` | 显存不足，或 ComfyUI 被系统强制结束（SIGKILL，通常是内存不足）；message 里带退出码、`oom_kill` 次数和内存峰值。worker 会自动被替换 | 可原样重试 1 次（新 worker 可能在另一台主机）；再失败则换较低 `quality` / 较短 `seconds` | 是 |
-| `generate_timeout` | 超过 840 s | 可降 `seconds` 重试 | 是 |
+| `generate_timeout` | 超过 1740 s（通常是 15 s 视频落在读盘很慢的主机上） | 可原样重试 1 次或降 `seconds` | 是 |
 | `upload_failed` | 写 R2 失败（凭据 / 网络） | 可重试 1 次；持续出现说明 R2 token 失效 | 是 |
 | `internal` | 其他（含权重缺失、ComfyUI 异常退出或长时间无响应，message 里带诊断信息） | 重试 1 次 | 是 |
 | （无 code 前缀） | 平台级错误，如 `executionTimeout exceeded`；或 `status` 为 `TIMED_OUT` / `CANCELLED` | 重试 1 次 | 是 |
