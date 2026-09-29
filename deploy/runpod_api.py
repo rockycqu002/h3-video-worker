@@ -62,12 +62,17 @@ def guard(endpoint):
 
 
 def create(a):
-    tpl = call("POST", "/templates", {"name": a.name, "imageName": a.image, "isServerless": True, "containerDiskInGb": a.disk,
-                                      "volumeInGb": 0, "ports": [], "env": base_env(a.extra_frame_host or ()), "category": "NVIDIA"})
+    if a.template:
+        tpl = call("GET", f"/templates/{a.template}")
+    else:
+        tpl = call("POST", "/templates", {"name": a.name, "imageName": a.image, "isServerless": True, "containerDiskInGb": a.disk,
+                                          "volumeInGb": 0, "ports": [], "env": base_env(a.extra_frame_host or ()), "category": "NVIDIA"})
     print("template:", json.dumps({k: tpl.get(k) for k in ("id", "name", "imageName", "containerDiskInGb")}, ensure_ascii=False))
     ep = call("POST", "/endpoints", {
         "templateId": tpl["id"], "name": a.name, "computeType": "GPU", "gpuTypeIds": [GPU], "gpuCount": 1,
-        "minCudaVersion": "13.0", "dataCenterIds": list(VOLUMES), "networkVolumeIds": list(VOLUMES.values()),
+        "minCudaVersion": "13.0", "dataCenterIds": list(VOLUMES),
+        # single region: networkVolumeId; multi-region needs networkVolumeIds as a list of objects (schema NetworkVolumeIdsInput)
+        "networkVolumeId": next(iter(VOLUMES.values())),
         "workersMin": 0, "workersMax": a.max_workers, "idleTimeout": a.idle, "executionTimeoutMs": 900000,
         "flashboot": True, "scalerType": "REQUEST_COUNT", "scalerValue": 1})
     print("endpoint:", ep.get("id"))
@@ -129,6 +134,7 @@ def main():
     c = sub.add_parser("create"); c.add_argument("--image", required=True); c.add_argument("--name", default="h3-video-4090")
     # the image is ~8 GB uncompressed; 30 GB leaves room for /tmp (frames, mp4) — qwen showed a too-small disk kills workers silently
     c.add_argument("--max-workers", type=int, default=1); c.add_argument("--disk", type=int, default=30); c.add_argument("--idle", type=int, default=60)
+    c.add_argument("--template", help="reuse an existing template id instead of creating one")
     c.add_argument("--extra-frame-host", action="append", help="additional keyframe host for tests, e.g. raw.githubusercontent.com"); c.set_defaults(fn=create)
     s = sub.add_parser("show"); s.add_argument("--endpoint", required=True); s.set_defaults(fn=show)
     u = sub.add_parser("update"); u.add_argument("--endpoint", required=True); u.add_argument("--max-workers", type=int); u.add_argument("--min-workers", type=int)
