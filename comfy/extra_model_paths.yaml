@@ -1,0 +1,6 @@
+# Weights live on the RunPod Network Volume (mounted at /runpod-volume on serverless workers).
+h3:
+    base_path: /runpod-volume/h3/models/
+    diffusion_models: diffusion_models
+    text_encoders: text_encoders
+    vae: vae

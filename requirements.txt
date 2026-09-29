@@ -1,0 +1,6 @@
+# worker-side packages on top of ComfyUI's own requirements (versions frozen by constraints.txt where present)
+runpod==1.12.0
+boto3
+pillow
+requests
+huggingface_hub

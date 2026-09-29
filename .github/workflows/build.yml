@@ -1,0 +1,124 @@
+name: build-and-push
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      # No weights in this image (they live on the network volume), but torch cu130 + ComfyUI is still ~10 GB
+      # uncompressed: merge the runner's spare /mnt disk into the docker data root and build with the daemon's own
+      # BuildKit ("docker" driver), as in qwen-image-edit-4090.
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 4096
+          temp-reserve-mb: 1024
+          swap-size-mb: 1024
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          build-mount-path: /var/lib/docker
+      - name: Restart docker on the enlarged data root
+        run: |
+          sudo systemctl restart docker
+          { echo "## Disk before build"; echo '```'; df -h / /var/lib/docker; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          df -h / /var/lib/docker
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve image name and tag
+        id: name
+        run: |
+          echo "image=$(echo 'ghcr.io/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" = "tag" ]; then echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT";
+          else echo "tag=dev-$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push runtime image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          build-args: |
+            BUILD_REF=${{ steps.name.outputs.tag }}
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ steps.name.outputs.image }}:${{ steps.name.outputs.tag }}
+            ${{ github.ref_type == 'tag' && format('{0}:latest', steps.name.outputs.image) || '' }}
+          cache-from: type=registry,ref=${{ steps.name.outputs.image }}:latest
+          cache-to: type=inline
+
+      - name: Disk after build
+        if: always()
+        run: |
+          { echo "## Disk after build"; echo '```'; df -h / /var/lib/docker; docker system df; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          df -h / /var/lib/docker; docker system df
+
+      - name: Extract lock files (image is in the local daemon with the docker driver)
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          IMG="${{ steps.name.outputs.image }}:${{ steps.name.outputs.tag }}"
+          docker run --rm --entrypoint cat "$IMG" /app/requirements.lock > out/requirements.lock
+          docker run --rm --entrypoint cat "$IMG" /app/requirements-h3ir.lock > out/requirements-h3ir.lock
+          docker run --rm --entrypoint python "$IMG" -c "import torch, importlib.metadata as m; print('torch', torch.__version__, torch.version.cuda, 'kitchen', m.version('comfy-kitchen'), 'runpod', m.version('runpod'))" | tee out/versions.txt
+          docker run --rm --entrypoint /opt/h3ir/bin/pip "$IMG" show open-h3-ir | grep -E '^(Name|Version)' | tee -a out/versions.txt
+
+      - name: Verify pushed image and write summary
+        run: |
+          set -euo pipefail
+          IMG="${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}"
+          # `imagetools inspect --raw` returns either a single manifest or an index; resolve to the amd64 manifest
+          docker buildx imagetools inspect "$IMG" --raw > raw.json
+          python3 - <<'PY'
+          import json, subprocess, sys
+          m = json.load(open("raw.json"))
+          if "manifests" in m:
+              d = next(x["digest"] for x in m["manifests"] if (x.get("platform") or {}).get("architecture", "amd64") == "amd64")
+              m = json.loads(subprocess.check_output(["docker", "buildx", "imagetools", "inspect", "${{ steps.name.outputs.image }}@" + d, "--raw"]))
+          json.dump(m, open("manifest.json", "w"))
+          layers = m["layers"]; big = max(l["size"] for l in layers); total = sum(l["size"] for l in layers)
+          print(f"layers: {len(layers)} largest: {big} total: {total}")
+          open("layers.txt", "w").write(f"{len(layers)} {big} {total}\n")
+          sys.exit(0 if big < 10_000_000_000 else 1)
+          PY
+          read -r LAYERS BIG TOTAL < layers.txt
+          {
+            echo "## Image"; echo '```'
+            echo "${{ steps.name.outputs.image }}:${{ steps.name.outputs.tag }}"
+            echo "digest: ${{ steps.build.outputs.digest }}"
+            echo "layers: $LAYERS, largest layer: $BIG bytes, total compressed: $TOTAL bytes"
+            cat out/versions.txt; echo '```'
+            echo "## requirements.lock"; echo '```'; cat out/requirements.lock; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: image-artifacts-${{ steps.name.outputs.tag }}
+          path: |
+            out/
+            manifest.json
+          if-no-files-found: ignore
