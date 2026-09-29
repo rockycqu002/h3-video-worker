@@ -176,13 +176,21 @@ def vram_used_mib():
         return None
 
 
-def ram_used_mib():
+def container_mem_mib():
+    """The container's own memory (cgroup v2: current / peak / limit); /proc/meminfo would report the whole host."""
+    out = {}
+    for name in ("memory.current", "memory.peak", "memory.max"):
+        try:
+            v = open(f"/sys/fs/cgroup/{name}").read().strip()
+            out[name.split(".")[1]] = None if v == "max" else int(v) // 2**20
+        except (OSError, ValueError):
+            pass
     try:
-        info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
-        kb = lambda k: int(info[k].split()[0])
-        return (kb("MemTotal") - kb("MemAvailable")) // 1024
-    except Exception:
-        return None
+        stat = dict(line.split()[:2] for line in open("/sys/fs/cgroup/memory.stat"))
+        out["anon"] = int(stat["anon"]) // 2**20            # excludes page cache (prefetched weights)
+    except (OSError, KeyError, ValueError):
+        pass
+    return out or None
 
 
 # ----------------------------------------------------------------------------- input
@@ -370,7 +378,7 @@ def handler(job):
                "seconds": p["seconds"], "seed": p["seed"], "steps": p["steps"], "mode": rewrite.mode_of(first, last),
                "prompt": prompt, "rewrite": rw, "timing": timing, "build": BUILD,
                "worker": {"jobs": _state["jobs"], "comfy_ready_s": _state["comfy_ready_s"], "prefetch_s": _state["prefetch_s"],
-                          "vram_used_mib": vram_used_mib(), "ram_used_mib": ram_used_mib()}}
+                          "vram_used_mib": vram_used_mib(), "mem_mib": container_mem_mib()}}
         log("job ok", job=jid, **{k: v for k, v in out.items() if k != "prompt"})
         return out
     except BadInput as e:

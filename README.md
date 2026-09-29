@@ -3,7 +3,7 @@
 RunPod Serverless worker: **MiniMax H3** text / keyframe → video with stereo audio (768p, 24 fps, 4–15 s), using the
 community **DaSiWa Hybrid 8-step** checkpoint (Turbo baked in) on **RTX 4090 / CUDA 13**, served through headless ComfyUI.
 Prompt expansion (open-h3-ir, with the official `h3-prompt-writing` skill as fallback) runs inside the worker; videos go
-to Cloudflare R2. The caller is a Cloudflare Worker. Design and decisions: [`docs/PLAN.md`](docs/PLAN.md).
+to Cloudflare R2. The caller is a Cloudflare Worker. Design and decisions: [`docs/PLAN.md`](docs/PLAN.md). Caller guide: [`docs/API_CALLER.md`](docs/API_CALLER.md).
 
 ```json
 POST https://api.runpod.ai/v2/<ENDPOINT_ID>/run
