@@ -36,6 +36,7 @@ COMFY_EXTRA_ARGS = shlex.split(os.environ.get("H3_COMFY_ARGS", "--reserve-vram 1
 BUILD = os.environ.get("H3_BUILD", "dev")
 JOB_DEADLINE_S = float(os.environ.get("H3_JOB_DEADLINE_S", 840))     # stay under the endpoint executionTimeout (900 s)
 COMFY_BOOT_S = float(os.environ.get("H3_COMFY_BOOT_S", 300))
+COMFY_SILENT_S = float(os.environ.get("H3_COMFY_SILENT_S", 180))  # tolerated HTTP silence from a live ComfyUI mid-generation
 PREFETCH = os.environ.get("H3_PREFETCH", "1") == "1"
 MAX_REQUEST_CHARS = 6000
 DEFAULTS = {"seconds": 5.0, "aspect": "auto", "quality": "768", "steps": 8, "creativity": "balanced"}
@@ -143,20 +144,37 @@ def comfy(path, body=None, timeout=60):
 
 
 def comfy_alive():
+    """Process liveness only. Under GPU/RAM pressure ComfyUI's HTTP server can take many seconds to answer, so a slow
+    /system_stats must never be taken as "dead" (v0.1.0 failed a healthy job that way)."""
     p = _procs.get("comfy")
-    if p is None or p.poll() is not None:
-        return False
+    return p is not None and p.poll() is None
+
+
+def comfy_death_report():
+    """Why ComfyUI is gone: exit code (-9 = SIGKILL, usually the OOM killer), cgroup OOM counters, memory, last log lines."""
+    p = _procs.get("comfy")
+    parts = [f"exit={p.returncode if p else None}"]
     try:
-        comfy("/system_stats", timeout=5); return True
-    except Exception:
-        return False
+        ev = dict(line.split()[:2] for line in open("/sys/fs/cgroup/memory.events"))
+        parts.append(f"oom={ev.get('oom')} oom_kill={ev.get('oom_kill')}")
+    except (OSError, ValueError):
+        pass
+    mem = container_mem_mib() or {}
+    parts.append(f"mem_peak={mem.get('peak')}MiB max={mem.get('max')}MiB")
+    try:
+        tail = [l.strip() for l in open("/tmp/comfy.log", errors="replace").readlines()[-40:] if l.strip()]
+        keep = [l for l in tail if any(k in l for k in ("Error", "error", "Killed", "memory", "Traceback", "CUDA"))][-3:] or tail[-2:]
+        parts.append("log: " + " | ".join(x[:200] for x in keep))
+    except OSError:
+        pass
+    return "; ".join(parts)
 
 
 def wait_comfy(deadline):
     while time.time() < deadline:
         p = _procs.get("comfy")
         if p is None or p.poll() is not None:
-            raise JobError("internal", f"ComfyUI exited during start (code {p.returncode if p else None})", refresh=True)
+            raise JobError("internal", f"ComfyUI exited during start ({comfy_death_report()})", refresh=True)
         try:
             comfy("/system_stats", timeout=5)
             if _state["comfy_ready_s"] is None:
@@ -276,13 +294,21 @@ def run_graph(job, graph, deadline):
     pid = comfy("/prompt", {"prompt": graph, "client_id": "h3-worker"}).get("prompt_id")
     if not pid:
         raise JobError("comfy_rejected", "ComfyUI returned no prompt_id")
-    t0, last_note = time.time(), 0
+    t0, last_note, last_ok = time.time(), 0, time.time()
     while True:
-        h = comfy(f"/history/{pid}")
-        if pid in h:
-            break
+        try:
+            h = comfy(f"/history/{pid}", timeout=30)
+            last_ok = time.time()
+            if pid in h:
+                break
+        except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as e:
+            # a busy ComfyUI answers slowly; only give up if the process is gone or it stays silent for long
+            if comfy_alive() and time.time() - last_ok > COMFY_SILENT_S:
+                raise JobError("internal", f"ComfyUI alive but unresponsive for {time.time() - last_ok:.0f} s ({type(e).__name__})", refresh=True)
         if not comfy_alive():
-            raise JobError("internal", "ComfyUI died during generation", refresh=True)
+            report = comfy_death_report()
+            killed = "exit=-9" in report            # SIGKILL: in a container this is almost always the OOM killer
+            raise JobError("oom" if killed else "internal", f"ComfyUI died during generation ({report})", refresh=True)
         if time.time() > deadline:
             try:
                 comfy("/queue", {"delete": [pid]}); comfy("/interrupt", {})

@@ -265,3 +265,76 @@ def test_handler_upload_failure(stubbed, monkeypatch):
 def test_handler_models_missing(stubbed):
     h._state["models_missing"] = ["vae/x.safetensors"]
     assert "model files missing" in h.handler({"id": "j7", "input": {"request": "a"}})["error"]
+
+
+# ----------------------------------------------------------------------------- ComfyUI liveness (v0.1.2)
+class FakeProc:
+    def __init__(self, rc=None):
+        self.returncode, self.pid = rc, 0
+
+    def poll(self):
+        return self.returncode
+
+
+def _history_ok(pid):
+    return {pid: {"status": {"status_str": "success"}, "outputs": {"save": {"images": [{"filename": "job_x.mp4", "subfolder": "job"}]}}}}
+
+
+def test_run_graph_tolerates_slow_http(monkeypatch):
+    import urllib.error
+    monkeypatch.setattr(h, "_procs", {"comfy": FakeProc()})
+    monkeypatch.setattr(h.time, "sleep", lambda s: None)
+    monkeypatch.setattr(h, "_progress", lambda job, msg: None)
+    calls = {"n": 0}
+
+    def comfy(path, body=None, timeout=60):
+        if path == "/prompt":
+            return {"prompt_id": "p1"}
+        calls["n"] += 1
+        if calls["n"] < 4:
+            raise urllib.error.URLError(TimeoutError("timed out"))   # busy server, process alive
+        return _history_ok("p1")
+    monkeypatch.setattr(h, "comfy", comfy)
+    path, _ = h.run_graph({}, {}, h.time.time() + 600)
+    assert path.endswith("job/job_x.mp4") and calls["n"] == 4
+
+
+def test_run_graph_sigkill_is_oom(monkeypatch):
+    proc = FakeProc()
+    monkeypatch.setattr(h, "_procs", {"comfy": proc})
+    monkeypatch.setattr(h.time, "sleep", lambda s: None)
+    monkeypatch.setattr(h, "comfy_death_report", lambda: "exit=-9; oom=1 oom_kill=1")
+
+    def comfy(path, body=None, timeout=60):
+        if path == "/prompt":
+            return {"prompt_id": "p1"}
+        proc.returncode = -9
+        return {}
+    monkeypatch.setattr(h, "comfy", comfy)
+    with pytest.raises(h.JobError) as e:
+        h.run_graph({}, {}, h.time.time() + 600)
+    assert e.value.code == "oom" and e.value.refresh and "exit=-9" in str(e.value)
+
+
+def test_run_graph_live_but_silent_gives_up(monkeypatch):
+    import urllib.error
+    monkeypatch.setattr(h, "_procs", {"comfy": FakeProc()})
+    monkeypatch.setattr(h, "COMFY_SILENT_S", 0.0)
+    monkeypatch.setattr(h.time, "sleep", lambda s: None)
+
+    def comfy(path, body=None, timeout=60):
+        if path == "/prompt":
+            return {"prompt_id": "p1"}
+        raise urllib.error.URLError(TimeoutError("timed out"))
+    monkeypatch.setattr(h, "comfy", comfy)
+    with pytest.raises(h.JobError, match="unresponsive") as e:
+        h.run_graph({}, {}, h.time.time() + 600)
+    assert e.value.code == "internal"
+
+
+def test_comfy_alive_is_process_based(monkeypatch):
+    monkeypatch.setattr(h, "comfy", lambda *a, **k: pytest.fail("liveness must not depend on HTTP"))
+    monkeypatch.setattr(h, "_procs", {"comfy": FakeProc()})
+    assert h.comfy_alive()
+    monkeypatch.setattr(h, "_procs", {"comfy": FakeProc(-9)})
+    assert not h.comfy_alive()
