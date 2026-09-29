@@ -130,10 +130,10 @@ Content-Type: application/json
 | `bad_input` | 参数越界、关键帧 URL 不合法 / 不在白名单 / 下载失败 / 不是 JPEG·PNG·WebP / > 16 MiB / > 50 MP | 否（message 可直接展示，中文） | 否（前置校验应拦住） |
 | `rewrite_failed` | 改写失败（OpenRouter 不可用 / 额度不足 / 模型输出不合格，已重试 3 次） | 可重试 1 次，或提示用户稍后再试 | 是 |
 | `comfy_rejected` | 模型执行报错 | 可重试 1 次 | 是 |
-| `oom` | 显存不足（worker 会自动被替换） | 可换较低 `quality` / 较短 `seconds` 重试 | 是 |
+| `oom` | 显存不足，或 ComfyUI 被系统强制结束（SIGKILL，通常是内存不足）；message 里带退出码、`oom_kill` 次数和内存峰值。worker 会自动被替换 | 可原样重试 1 次（新 worker 可能在另一台主机）；再失败则换较低 `quality` / 较短 `seconds` | 是 |
 | `generate_timeout` | 超过 840 s | 可降 `seconds` 重试 | 是 |
 | `upload_failed` | 写 R2 失败（凭据 / 网络） | 可重试 1 次；持续出现说明 R2 token 失效 | 是 |
-| `internal` | 其他（含权重缺失、ComfyUI 崩溃） | 重试 1 次 | 是 |
+| `internal` | 其他（含权重缺失、ComfyUI 异常退出或长时间无响应，message 里带诊断信息） | 重试 1 次 | 是 |
 | （无 code 前缀） | 平台级错误，如 `executionTimeout exceeded`；或 `status` 为 `TIMED_OUT` / `CANCELLED` | 重试 1 次 | 是 |
 
 对已发出但没拿到响应的 `/run` 不要盲目重试——平台可能已接收并计费；先用自己记录的 task 查一下是否拿到过 job id。
