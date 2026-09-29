@@ -118,7 +118,7 @@ h3-video-worker/
 
 ## 8. 待定 / 风险
 
-- **Volume 机房（限美国）**：支持 Volume 的美国机房有 US-CA-2、US-CO-1、US-IL-1、US-MO-2、US-NC-2、US-NE-1、US-TX-3。serverless 各机房 4090 余量无法通过 API 准确查询；qwen worker 多落在 US-CA-2、US-TX-3，故首选 **US-CA-2**。需确认 RunPod 当前是否支持一个 endpoint 挂多个机房的 Volume，若支持再加 US-TX-3 做冗余。
+- **Volume 机房（限美国）**：支持 Volume 的美国机房有 US-CA-2、US-CO-1、US-IL-1、US-MO-2、US-NC-2、US-NE-1、US-TX-3。serverless 各机房 4090 余量无法通过 API 准确查询；qwen worker 多落在 US-CA-2、US-TX-3，故首选 **US-CA-2**。RunPod 支持 `networkVolumeIds`（多机房 Volume）。**初期只用 US-CA-2**（请求量小）；若出现排队/throttled 过多，再加 US-TX-3、US-IL-1 的 Volume，并考虑让 worker 在 Volume 缺权重时自行下载。
 - **系统内存**：AutoDL 上 cgroup 上限 120 GB 内跑通，4090 serverless 主机内存需在第 4 步实测峰值。
 - **24 GB 顶满**：AutoDL 峰值显存 23.8 GB，4090 无余量；若 serverless 主机上 OOM，退路是降默认 quality 或改用 5090。
 - **预热**：不做 qwen 那样的开机试跑（一次生成要几分钟，太贵）；改为开机时后台把权重顺序读一遍进页缓存，与第一单的改写并行。主机内存若小于权重体积则收益有限，第 5 步用 `H3_PREFETCH=0/1` 对比。
