@@ -338,3 +338,28 @@ def test_comfy_alive_is_process_based(monkeypatch):
     assert h.comfy_alive()
     monkeypatch.setattr(h, "_procs", {"comfy": FakeProc(-9)})
     assert not h.comfy_alive()
+
+
+# ----------------------------------------------------------------------------- memory sampler (v0.1.3)
+def test_mem_report_phases_and_events():
+    m = h.MemSampler()
+    m.samples.extend([(1.0, "boot", 100, 5000, 5100), (5.0, "rewrite+boot", 900, 20000, 20900),
+                      (9.0, "generating", 30000, 12000, 42000), (13.0, "generating", 38000, 6000, 44000), (17.0, "uploading", 20000, 9000, 29000)])
+    m.events.extend([(2.0, "prefetch start"), (10.0, "Requested to load MiniMaxH3"), (12.0, "loaded partially 18000 MB")])
+    r = m.report(since=4.0)
+    assert set(r["phases"]) == {"rewrite+boot", "generating", "uploading"}
+    assert r["phases"]["generating"]["anon_max"] == 38000 and r["phases"]["generating"]["from"] == 9.0
+    assert [e[1] for e in r["events"]] == ["Requested to load MiniMaxH3", "loaded partially 18000 MB"]
+    assert r["timeline"][0] == [5.0, "rewrite+boot", 900, 20000]
+
+
+def test_mem_event_regex():
+    for line in ("Requested to load MiniMaxH3", "loaded partially; 18000.00 MB usable", "Prompt executed in 170.1 seconds",
+                 "torch.OutOfMemoryError: CUDA out of memory"):
+        assert h.MemSampler.EVENT_RE.search(line), line
+    assert not h.MemSampler.EVENT_RE.search(" 50%|█████     | 4/8 [01:10<01:10, 17.5s/it]")
+
+
+def test_memstat_shape():
+    m = h.memstat()          # whatever this machine exposes; must not raise
+    assert m is None or {"current", "anon", "max"} <= set(m)

@@ -14,7 +14,7 @@ returns {"video_key": "videos/<job_id>.mp4", ...} or {"error": "<code>: <message
 At boot ComfyUI and open-h3-ir start in the background and the weight files are read into the page cache, so the
 first job's rewrite overlaps with the cold start. Models are loaded by ComfyUI on the first prompt and then reused.
 """
-import atexit, concurrent.futures, glob, json, os, secrets, shlex, signal, subprocess, sys, threading, time, traceback, urllib.error, urllib.request
+import atexit, collections, concurrent.futures, glob, json, os, re, secrets, shlex, signal, subprocess, sys, threading, time, traceback, urllib.error, urllib.request
 
 os.environ.setdefault("RUNPOD_LOG_LEVEL", "WARN")   # the SDK would otherwise log job payloads at DEBUG/INFO
 
@@ -64,6 +64,8 @@ def _tail(path, tag):
             line = f.readline()
             if line:
                 sys.stdout.write(f"[{tag}] " + line); sys.stdout.flush()
+                if tag == "comfy" and MEM.EVENT_RE.search(line):
+                    MEM.event(line)
             else:
                 time.sleep(0.2)
 
@@ -115,6 +117,7 @@ def check_models():
 def prefetch():
     """Read the weights once so ComfyUI's first load comes from the page cache instead of the network volume."""
     t0 = time.time()
+    MEM.event("prefetch start")
     for rel in MODEL_FILES:
         try:
             with open(os.path.join(MODELS_DIR, rel), "rb", buffering=0) as f:
@@ -123,6 +126,7 @@ def prefetch():
         except OSError as e:
             log("prefetch failed", file=rel, error=str(e)); return
     _state["prefetch_s"] = round(time.time() - t0, 1)
+    MEM.event("prefetch done")
     log("prefetch done", seconds=_state["prefetch_s"])
 
 
@@ -160,7 +164,13 @@ def comfy_death_report():
     except (OSError, ValueError):
         pass
     mem = container_mem_mib() or {}
-    parts.append(f"mem_peak={mem.get('peak')}MiB max={mem.get('max')}MiB")
+    parts.append(f"mem_peak={mem.get('peak')}MiB max={mem.get('max')}MiB anon={mem.get('anon')}MiB file={mem.get('file')}MiB")
+    try:
+        r = MEM.report(since=_state.get("job_t", 0.0))
+        parts.append("anon_max_by_phase=" + ",".join(f"{k}:{v['anon_max']}" for k, v in r["phases"].items()))
+        parts.append("last_events=" + " | ".join(f"{t}s {e[:80]}" for t, e in r["events"][-4:]))
+    except Exception:
+        pass
     try:
         tail = [l.strip() for l in open("/tmp/comfy.log", errors="replace").readlines()[-40:] if l.strip()]
         keep = [l for l in tail if any(k in l for k in ("Error", "error", "Killed", "memory", "Traceback", "CUDA"))][-3:] or tail[-2:]
@@ -194,21 +204,97 @@ def vram_used_mib():
         return None
 
 
-def container_mem_mib():
-    """The container's own memory (cgroup v2: current / peak / limit); /proc/meminfo would report the whole host."""
-    out = {}
-    for name in ("memory.current", "memory.peak", "memory.max"):
-        try:
-            v = open(f"/sys/fs/cgroup/{name}").read().strip()
-            out[name.split(".")[1]] = None if v == "max" else int(v) // 2**20
-        except (OSError, ValueError):
-            pass
+def _read_int(path):
     try:
-        stat = dict(line.split()[:2] for line in open("/sys/fs/cgroup/memory.stat"))
-        out["anon"] = int(stat["anon"]) // 2**20            # excludes page cache (prefetched weights)
-    except (OSError, KeyError, ValueError):
-        pass
-    return out or None
+        v = open(path).read().strip()
+        return None if v == "max" else int(v)
+    except (OSError, ValueError):
+        return None
+
+
+def _read_kv(path):
+    try:
+        return {k: int(v) for k, v in (line.split()[:2] for line in open(path))}
+    except (OSError, ValueError):
+        return {}
+
+
+def memstat():
+    """The container's own memory in MiB (cgroup v2, falling back to v1); /proc/meminfo would report the whole host.
+    anon = process memory (what the OOM killer is about); file = page cache (prefetched / mmapped weights, reclaimable)."""
+    mib = lambda b: None if b is None else b // 2**20
+    if os.path.exists("/sys/fs/cgroup/memory.current"):
+        st, ev = _read_kv("/sys/fs/cgroup/memory.stat"), _read_kv("/sys/fs/cgroup/memory.events")
+        return {"cg": 2, "current": mib(_read_int("/sys/fs/cgroup/memory.current")), "peak": mib(_read_int("/sys/fs/cgroup/memory.peak")),
+                "max": mib(_read_int("/sys/fs/cgroup/memory.max")), "anon": mib(st.get("anon")), "file": mib(st.get("file")),
+                "swap": mib(_read_int("/sys/fs/cgroup/memory.swap.current")), "oom_kill": ev.get("oom_kill"), "high_events": ev.get("high")}
+    base = "/sys/fs/cgroup/memory"
+    if os.path.exists(f"{base}/memory.usage_in_bytes"):
+        st = _read_kv(f"{base}/memory.stat")
+        limit = _read_int(f"{base}/memory.limit_in_bytes")
+        oom = _read_kv(f"{base}/memory.oom_control")
+        return {"cg": 1, "current": mib(_read_int(f"{base}/memory.usage_in_bytes")), "peak": mib(_read_int(f"{base}/memory.max_usage_in_bytes")),
+                "max": mib(limit) if limit and limit < 2**60 else None, "anon": mib(st.get("total_rss", st.get("rss"))),
+                "file": mib(st.get("total_cache", st.get("cache"))), "swap": mib(st.get("total_swap")), "oom_kill": oom.get("oom_kill")}
+    return None
+
+
+def container_mem_mib():
+    m = memstat()
+    return {k: m[k] for k in ("current", "peak", "max", "anon", "file", "oom_kill") if k in m} if m else None
+
+
+class MemSampler:
+    """Samples memstat() every 2 s from boot, tagged with the handler's current phase; ComfyUI log lines about model
+    loading are timestamped by the log forwarder. Together they show *when* memory grows (load / sample / decode)."""
+    EVENT_RE = re.compile(r"(Requested to load|loaded (completely|partially)|[Uu]nload|Prompt executed|out of memory|OutOfMemory|Killed|"
+                          r"model_type|Using .* attention|lowvram|offload|Traceback|Error)")
+
+    def __init__(self, interval=2.0):
+        self.t0, self.interval, self.phase = time.time(), interval, "boot"
+        self.samples = collections.deque(maxlen=4000)      # (t, phase, anon, file, current)
+        self.events = collections.deque(maxlen=300)        # (t, text)
+        self.lock = threading.Lock()
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        return self
+
+    def set_phase(self, phase):
+        self.phase = phase
+
+    def event(self, text):
+        with self.lock:
+            self.events.append((round(time.time() - self.t0, 1), text.strip()[:180]))
+
+    def _run(self):
+        last_log = 0
+        while True:
+            m = memstat() or {}
+            t = round(time.time() - self.t0, 1)
+            with self.lock:
+                self.samples.append((t, self.phase, m.get("anon"), m.get("file"), m.get("current")))
+            if t - last_log >= 10:                          # also into the RunPod log, in case the worker dies
+                log("mem", t=t, phase=self.phase, anon=m.get("anon"), file=m.get("file"), current=m.get("current"), max=m.get("max"),
+                    oom_kill=m.get("oom_kill"))
+                last_log = t
+            time.sleep(self.interval)
+
+    def report(self, since=0.0, points=60):
+        """Per-phase peaks + a downsampled timeline + ComfyUI events, all from `since` (seconds after boot)."""
+        with self.lock:
+            s = [x for x in self.samples if x[0] >= since]
+            ev = [e for e in self.events if e[0] >= since]
+        phases = {}
+        for t, ph, anon, file, cur in s:
+            p = phases.setdefault(ph, {"anon_max": 0, "current_max": 0, "from": t, "to": t})
+            p["anon_max"] = max(p["anon_max"], anon or 0); p["current_max"] = max(p["current_max"], cur or 0); p["to"] = t
+        step = max(1, len(s) // points)
+        return {"limit": (memstat() or {}).get("max"), "phases": phases,
+                "timeline": [[t, ph, anon, file] for t, ph, anon, file, _ in s[::step]], "events": ev[-40:]}
+
+
+MEM = MemSampler()
 
 
 # ----------------------------------------------------------------------------- input
@@ -337,6 +423,8 @@ def _cleanup(paths):
 def handler(job):
     jid = str(job.get("id") or "")
     t0 = time.time()
+    _state["job_t"] = round(t0 - MEM.t0, 1)
+    MEM.set_phase("preparing"); MEM.event(f"job start {jid}")
     timing, paths = {"boot": None}, []
     try:
         try:
@@ -360,7 +448,7 @@ def handler(job):
         # rewrite runs in a thread while this thread waits for ComfyUI (cold start) — the two overlap
         fut = None
         if not p["skip_rewrite"]:
-            _progress(job, "rewriting")
+            _progress(job, "rewriting"); MEM.set_phase("rewrite+boot")
             ex = concurrent.futures.ThreadPoolExecutor(1)
             fut = ex.submit(rewrite.rewrite, p["request"], p["seconds"], p["aspect"], frames, workflow.FPS, first, last,
                             p["creativity"], os.environ.get("OPENROUTER_API_KEY", ""), TMP_DIR)
@@ -371,6 +459,8 @@ def handler(job):
                 names[tag] = f"{jid}_{tag}.png"
                 path = os.path.join(IN_DIR, names[tag]); im.save(path, format="PNG", compress_level=1); paths.append(path)
         tb = time.time()
+        if fut is None:
+            MEM.set_phase("boot-wait")
         wait_comfy(min(deadline, time.time() + COMFY_BOOT_S))
         timing["boot"] = round(time.time() - tb, 1)
         if fut is not None:
@@ -385,13 +475,13 @@ def handler(job):
             prompt, rw = p["request"], {"engine": "none", "status": "skipped", "seconds": 0}
         timing["rewrite"] = rw.get("seconds")
 
-        _progress(job, "generating")
+        _progress(job, "generating"); MEM.set_phase("generating")
         graph = workflow.build(prompt, w, h, p["seconds"], p["seed"], p["steps"], f"job/{jid}", names.get("first"), names.get("last"))
         out_path, gen_s = run_graph(job, graph, deadline)
         paths.append(out_path)
         timing["generate"] = round(gen_s, 1)
 
-        _progress(job, "uploading")
+        _progress(job, "uploading"); MEM.set_phase("uploading")
         tu = time.time()
         try:
             nbytes = storage.upload_video(out_path, key)
@@ -404,7 +494,7 @@ def handler(job):
                "seconds": p["seconds"], "seed": p["seed"], "steps": p["steps"], "mode": rewrite.mode_of(first, last),
                "prompt": prompt, "rewrite": rw, "timing": timing, "build": BUILD,
                "worker": {"jobs": _state["jobs"], "comfy_ready_s": _state["comfy_ready_s"], "prefetch_s": _state["prefetch_s"],
-                          "vram_used_mib": vram_used_mib(), "mem_mib": container_mem_mib()}}
+                          "vram_used_mib": vram_used_mib(), "mem_mib": container_mem_mib(), "mem": MEM.report(since=_state["job_t"])}}
         log("job ok", job=jid, **{k: v for k, v in out.items() if k != "prompt"})
         return out
     except BadInput as e:
@@ -418,6 +508,7 @@ def handler(job):
         log("job failed", job=jid, code="internal", error=str(e)[:800], tb=traceback.format_exc()[-1500:])
         return {"error": f"internal: {type(e).__name__}: {str(e)[:500]}", **({"refresh_worker": True} if not comfy_alive() else {})}
     finally:
+        MEM.set_phase("idle"); MEM.event(f"job end {jid}")
         _cleanup(paths + glob.glob(os.path.join(OUT_DIR, "job", f"{jid}*")))
 
 
@@ -425,6 +516,7 @@ def main():
     atexit.register(stop_children)
     for s in (signal.SIGTERM, signal.SIGINT):
         signal.signal(s, lambda *_: (stop_children(), sys.exit(0)))
+    MEM.start()
     log("boot", build=BUILD, comfy_args=" ".join(COMFY_EXTRA_ARGS), models_dir=MODELS_DIR)
     start_comfy()
     start_h3ir()
