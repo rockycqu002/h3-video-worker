@@ -23,7 +23,7 @@ RunPod API key、R2 凭据只能放在 Worker 的 secret 里，不能下发到�
 | 执行超时 | 900 s（worker 在 840 s 主动中止并返回 `generate_timeout`） |
 | 结果保留 | `/run` 的结果在 RunPod 侧保留约 **30 分钟**；视频本身在 R2，不受影响 |
 | 扩缩容 | 0–N 个 worker（测试 endpoint N=1），每个 worker 同时只跑 1 个任务，多余请求排队 |
-| 成本（估算） | 4090 worker $0.74/h，热启动一条 5 s 视频 ≈ $0.04；冷启动多 $0.01–0.03；改写（OpenRouter）< $0.01。以 RunPod 账单为准 |
+| 成本（估算） | 4090 serverless 按秒计费 ≈ $0.000306/s（$1.10/h，取自本账户 qwen 4090 endpoint 的实际账单），含冷启动与 60 s 空闲保温。5 s 视频：连续请求 ≈ $0.06/条；零散请求（冷启动 + 保温）≈ $0.09/条；最坏 ≈ $0.15。改写（OpenRouter）< $0.01。以 RunPod 账单为准 |
 
 ---
 
