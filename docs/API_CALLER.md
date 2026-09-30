@@ -11,7 +11,7 @@ RunPod API key、R2 凭据只能放在 Worker 的 secret 里，不能下发到�
 
 | 项 | 值 |
 |---|---|
-| Endpoint ID | 测试：`ekb0yn2gdsmyjo`（`h3-video-4090-test`）；正式 endpoint 上线后替换，**用环境变量 `RUNPOD_H3_ENDPOINT_ID`，不要写死** |
+| Endpoint ID | **正式：`zobq85s4yao4r6`（`h3-video-4090`，0–3 worker）**；预发布：`ekb0yn2gdsmyjo`（`h3-video-4090-test`，1 worker，关键帧白名单额外放行 raw.githubusercontent.com，仅供测试）。用环境变量 `RUNPOD_H3_ENDPOINT_ID`，不要写死 |
 | API 根地址 | `https://api.runpod.ai/v2/<ENDPOINT_ID>` |
 | 鉴权 | `Authorization: Bearer <RUNPOD_API_KEY>` |
 | 调用模式 | 队列式：`POST /run` 提交（带 `webhook`）；`GET /status/{id}` 兜底查询。**不要用 `/runsync`**（任务要几分钟） |
@@ -22,7 +22,7 @@ RunPod API key、R2 凭据只能放在 Worker 的 secret 里，不能下发到�
 | 时长与耗时 | **超线性**：8 s ≈ 2×、10 s ≈ 3×、15 s ≈ 6× 的 5 s 耗时（注意力计算随长度平方增长）。前端应按时长给出不同的预计等待时间 |
 | 执行超时 | 1800 s（worker 在 1740 s 主动中止并返回 `generate_timeout`）。15 s 视频正常需要约 17–20 分钟 |
 | 结果保留 | `/run` 的结果在 RunPod 侧保留约 **30 分钟**；视频本身在 R2，不受影响 |
-| 扩缩容 | 0–N 个 worker（测试 endpoint N=1），每个 worker 同时只跑 1 个任务，多余请求排队 |
+| 扩缩容 | 正式 endpoint 0–3 个 worker，每个 worker 同时只跑 1 个任务；超过 3 个并发请求时排队（15 s 视频一条约 17 分钟，高峰期排队会很长，按需申请提高配额） |
 | 成本（按实测耗时 × 实际费率） | 4090 serverless ≈ $0.000306/s（$1.10/h，取自本账户 qwen 4090 endpoint 的实际账单），含冷启动与 60 s 空闲保温。worker 已热时每条：**5 s ≈ $0.055、8 s ≈ $0.10、10 s ≈ $0.16、15 s ≈ $0.31**；零散请求每条再加 ≈ $0.03（冷启动 + 保温）。改写（OpenRouter）< $0.01。以 RunPod 账单为准 |
 
 ---
