@@ -136,6 +136,8 @@ Content-Type: application/json
 | `internal` | 其他（含权重缺失、ComfyUI 异常退出或长时间无响应，message 里带诊断信息） | 重试 1 次 | 是 |
 | （无 code 前缀） | 平台级错误，如 `executionTimeout exceeded`；或 `status` 为 `TIMED_OUT` / `CANCELLED` | 重试 1 次 | 是 |
 
+`/run` 本身返回 HTTP 409（endpoint 正在更新配置 / 发布）、429 或 5xx 时，任务**没有**被接收，按 2 s、5 s、15 s 退避重试即可（实测：改完 endpoint 配置后立刻提交会收到 409）。
+
 对已发出但没拿到响应的 `/run` 不要盲目重试——平台可能已接收并计费；先用自己记录的 task 查一下是否拿到过 job id。
 
 ---
