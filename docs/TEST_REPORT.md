@@ -1,11 +1,11 @@
 # H3 视频 worker 测试报告（RunPod Serverless · RTX 4090）
 
-测试日期：2026-09-29（UTC 13:40–17:50）　测试 endpoint：`ekb0yn2gdsmyjo`（`h3-video-4090-test`，max 1 worker）
+测试日期：2026-09-29（UTC 13:40–18:40）　测试 endpoint：`ekb0yn2gdsmyjo`（`h3-video-4090-test`，max 1 worker）
 镜像：v0.1.0 → v0.1.4（`ghcr.io/rockycqu002/h3-video-worker`）　权重：Network Volume `zpzkjk80go`（US-CA-2）
 
 ## 1. 结论
 
-1. **四种模式都能用**：T2V、I2V、FL2V（首尾帧，走 skill 改写）、跳过改写，5–15 s 全部生成成功（v0.1.3 + `--fast-disk` 起）。
+1. **四种模式都能用**：T2V、I2V、FL2V（首尾帧，走 skill 改写）、跳过改写均已实测；T2V / I2V / FL2V 在最长的 15 s 下都成功，进程内存峰值 ≤ 18.6 GB（v0.1.3 + `--fast-disk` 起）。
 2. **找到并修复了 OOM**：RunPod 4090 worker 的容器内存上限是 **43,869 MiB**。ComfyUI 0.37 默认把约 37 GB 权重副本常驻在进程内存里，
    5 s / 8 s 视频的峰值已经贴着上限，10 s 视频在 VAE 解码时被系统 OOM 杀掉（exit -9）。加上 ComfyUI 参数 `--fast-disk` 后，
    进程内存峰值降到 **7–18 GB**，生成速度不变。v0.1.4 起这是默认参数。
@@ -53,6 +53,8 @@
 | 19 | v0.1.3 + fast-disk | I2V 10 s | ✅ | 10 | 34.0 openh3ir | 539.2 | 12,648 | 首单，预读关 |
 | 20 | **v0.1.4** | I2V 8 s | ✅ | 96 | 39.4 openh3ir | 357.7 | 10,317 | 默认参数（`--fast-disk`、预读开），首单含模型加载 |
 | 21 | **v0.1.4** | T2V 5 s | ✅ | 5.9 | 13.3 openh3ir | 161.1 | 7,187 | 新 worker 首单，含模型加载；首次提交遇到 `/run` 返回 HTTP 409（endpoint 刚改完配置），重提后成功 |
+| 22 | **v0.1.4** | I2V 15 s | ✅ | 29 | 21.2 openh3ir | 1032.9 | 18,017 | 新 worker 首单，含模型加载；总占用峰值 35,865 |
+| 23 | **v0.1.4** | FL2V 15 s | ✅ | 热 | 6.9 skill | 1063.8 | 18,555 | 对齐行 0.00 s / 15.08 s 正确；总占用峰值 36,070 |
 
 ## 4. OOM 根因分析
 
@@ -106,7 +108,8 @@
 
 - **视频质量**：本轮只验证了能生成、格式正确（mp4、H.264 + AAC），画面和声音效果由调用方集成后人工评估。
 - **并发**：测试 endpoint 只有 1 个 worker，没测多 worker 同时跑。
-- **L2V**（只有尾帧）、竖屏 / 其他比例、低 quality 档：代码路径与已测模式相同，未单独实测。
+- **L2V**（只有尾帧）、FL2V 8 s / 10 s、竖屏 / 其他比例、低 quality 档：代码路径与已测模式相同，未单独实测。
+- **显存峰值**：只在任务结束时读了一次（15 s 为 14.8–15.3 GB，5 s 为 22.3 GB），没有采样峰值；需要时在采样器里加 `nvidia-smi` 采样。
 - **账单核对**：本 endpoint 的实际扣费入账后再核对成本表。
 - **上线前**：建正式 endpoint；从 `FRAME_URL_ALLOW` 去掉测试用的 `raw.githubusercontent.com`；删除测试 endpoint / template；
   CF Worker 侧实现输入审核、webhook、配额；给 R2 设生命周期规则。
