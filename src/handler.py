@@ -9,7 +9,12 @@ Protocol (see docs/PLAN.md §3):
   input.quality          768 | 640 | 544 | 416 (short edge), default 768
   input.seed / steps     optional
   input.first_frame_url / last_frame_url   https URLs on an allow-listed host (R2 presigned)
-returns {"video_key": "videos/<job_id>.mp4", ...} or {"error": "<code>: <message>"} (RunPod reports it as FAILED).
+  input.ref_image_urls   Ref2VA: up to 9 reference images  -> <Picture 1..n> in the prompt
+  input.ref_video_urls   Ref2VA: up to 3 reference videos, 24 fps, 2–15 s -> <Video 1..k>
+  input.ref_video_audio  bool, default false: also condition on each reference video's soundtrack -> <Audio k>
+                         (Ref2VA needs skip_rewrite=true with a finished six-section prompt; no keyframes alongside)
+returns {"video_key": "videos/<job_id>.mp4", "video_url": "<presigned GET>", ...} or {"error": "<code>: <message>"}
+(RunPod reports it as FAILED).
 
 At boot ComfyUI and open-h3-ir start in the background and the weight files are read into the page cache, so the
 first job's rewrite overlaps with the cold start. Models are loaded by ComfyUI on the first prompt and then reused.
@@ -41,6 +46,8 @@ COMFY_BOOT_S = float(os.environ.get("H3_COMFY_BOOT_S", 300))
 COMFY_SILENT_S = float(os.environ.get("H3_COMFY_SILENT_S", 180))  # tolerated HTTP silence from a live ComfyUI mid-generation
 PREFETCH = os.environ.get("H3_PREFETCH", "1") == "1"
 MAX_REQUEST_CHARS = 6000
+MAX_REF_IMAGES, MAX_REF_VIDEOS = 9, 3         # MiniMaxH3ReferenceToVideo's autogrow limits
+VIDEO_URL_TTL_S = float(os.environ.get("H3_VIDEO_URL_TTL_S", 6 * 3600))   # output.video_url lifetime
 DEFAULTS = {"seconds": 5.0, "aspect": "auto", "quality": "768", "steps": 8, "creativity": "balanced"}
 LIMITS = {"seconds": (4.0, 15.0), "steps": (6, 12), "seed": (0, 2**53)}
 
@@ -324,6 +331,16 @@ def _choice(v, name, options, default):
     return v
 
 
+def _url_list(v, name, limit):
+    if v is None:
+        return []
+    if not isinstance(v, list) or not all(isinstance(u, str) and u for u in v):
+        raise BadInput(f"{name} 必须是 URL 字符串数组")
+    if len(v) > limit:
+        raise BadInput(f"{name} 最多 {limit} 个")
+    return list(v)
+
+
 def parse_input(inp):
     if not isinstance(inp, dict):
         raise BadInput("input 必须是对象")
@@ -336,6 +353,19 @@ def parse_input(inp):
     if not isinstance(skip, bool):
         raise BadInput("skip_rewrite 必须是布尔值")
     seed = _number(inp.get("seed"), "seed", None, int)
+    ref_images = _url_list(inp.get("ref_image_urls"), "ref_image_urls", MAX_REF_IMAGES)
+    ref_videos = _url_list(inp.get("ref_video_urls"), "ref_video_urls", MAX_REF_VIDEOS)
+    ref_audio = inp.get("ref_video_audio", False)
+    if not isinstance(ref_audio, bool):
+        raise BadInput("ref_video_audio 必须是布尔值")
+    if ref_audio and not ref_videos:
+        raise BadInput("ref_video_audio 需要 ref_video_urls")
+    if ref_images or ref_videos:
+        if inp.get("first_frame_url") or inp.get("last_frame_url"):
+            raise BadInput("参考图 / 参考视频不能与 first_frame_url / last_frame_url 同时使用")
+        if not skip:
+            # neither open-h3-ir nor the skill fallback writes the six-section Ref2VA format yet
+            raise BadInput("参考模式（Ref2VA）暂不支持自动改写：需 skip_rewrite=true，并在 request 里传最终 H3 prompt")
     return {
         "request": req.strip(), "skip_rewrite": skip,
         "creativity": _choice(inp.get("creativity"), "creativity", rewrite.CREATIVITY, DEFAULTS["creativity"]),
@@ -345,16 +375,18 @@ def parse_input(inp):
         "steps": _number(inp.get("steps"), "steps", DEFAULTS["steps"], int),
         "seed": seed if seed is not None else secrets.randbelow(2**32),
         "first_frame_url": inp.get("first_frame_url") or None, "last_frame_url": inp.get("last_frame_url") or None,
+        "ref_image_urls": ref_images, "ref_video_urls": ref_videos, "ref_video_audio": ref_audio,
     }
 
 
-def canvas(p, first, last):
-    """"auto" follows the keyframe's aspect (first frame preferred), otherwise 16:9."""
+def canvas(p, first, last, ref_ratio=None):
+    """"auto" follows the keyframe's aspect (first frame preferred), then the reference ratio (w/h), otherwise 16:9."""
     anchor = first if first is not None else last
     if p["aspect"] == "auto":
-        if anchor is None:
+        ratio = anchor.width / anchor.height if anchor is not None else ref_ratio
+        if not ratio:
             return workflow.resolution("16:9", p["quality"])
-        return workflow.resolution("16:9", p["quality"], ratio=anchor.width / anchor.height)
+        return workflow.resolution("16:9", p["quality"], ratio=ratio)
     return workflow.resolution(p["aspect"], p["quality"])
 
 
@@ -442,10 +474,21 @@ def handler(job):
         last = storage.fetch_image("last_frame_url", p["last_frame_url"]) if p["last_frame_url"] else None
         first = workflow.normalize(first) if first is not None else None
         last = workflow.normalize(last) if last is not None else None
-        w, h = canvas(p, first, last)
+        # Ref2VA references: images keep their own aspect (no crop), videos are checked and handed to ComfyUI as files
+        ref_images = [workflow.fit_reference(workflow.normalize(storage.fetch_image(f"ref_image_urls[{i}]", u)))
+                      for i, u in enumerate(p["ref_image_urls"])]
+        ref_videos = []
+        for k, u in enumerate(p["ref_video_urls"]):
+            name = f"{jid}_ref_video_{k}.mp4"
+            path = os.path.join(IN_DIR, name); paths.append(path)
+            ref_videos.append((name, storage.fetch_video(f"ref_video_urls[{k}]", u, path, need_audio=p["ref_video_audio"])))
+        ref_ratio = (ref_videos[0][1]["width"] / ref_videos[0][1]["height"] if ref_videos
+                     else ref_images[0].width / ref_images[0].height if ref_images else None)
+        w, h = canvas(p, first, last, ref_ratio)
         first = workflow.cover_crop(first, w, h) if first is not None else None
         last = workflow.cover_crop(last, w, h) if last is not None else None
         frames = workflow.frames_for_seconds(p["seconds"])
+        mode = "ref2v" if (ref_images or ref_videos) else rewrite.mode_of(first, last)
 
         # rewrite runs in a thread while this thread waits for ComfyUI (cold start) — the two overlap
         fut = None
@@ -460,6 +503,10 @@ def handler(job):
             if im is not None:
                 names[tag] = f"{jid}_{tag}.png"
                 path = os.path.join(IN_DIR, names[tag]); im.save(path, format="PNG", compress_level=1); paths.append(path)
+        ref_image_names = []
+        for i, im in enumerate(ref_images):
+            ref_image_names.append(f"{jid}_ref_image_{i}.png")
+            path = os.path.join(IN_DIR, ref_image_names[-1]); im.save(path, format="PNG", compress_level=1); paths.append(path)
         tb = time.time()
         if fut is None:
             MEM.set_phase("boot-wait")
@@ -478,7 +525,8 @@ def handler(job):
         timing["rewrite"] = rw.get("seconds")
 
         _progress(job, "generating"); MEM.set_phase("generating")
-        graph = workflow.build(prompt, w, h, p["seconds"], p["seed"], p["steps"], f"job/{jid}", names.get("first"), names.get("last"))
+        graph = workflow.build(prompt, w, h, p["seconds"], p["seed"], p["steps"], f"job/{jid}", names.get("first"), names.get("last"),
+                               ref_images=ref_image_names, ref_videos=[n for n, _ in ref_videos], ref_video_audio=p["ref_video_audio"])
         out_path, gen_s = run_graph(job, graph, deadline)
         paths.append(out_path)
         timing["generate"] = round(gen_s, 1)
@@ -487,17 +535,21 @@ def handler(job):
         tu = time.time()
         try:
             nbytes = storage.upload_video(out_path, key)
+            video_url = storage.presign_video(key, VIDEO_URL_TTL_S)
         except Exception as e:
             raise JobError("upload_failed", f"{type(e).__name__}: {str(e)[:300]}")
         timing["upload"] = round(time.time() - tu, 1)
         timing["total"] = round(time.time() - t0, 1)
         _state["jobs"] += 1
-        out = {"video_key": key, "bytes": nbytes, "width": w, "height": h, "frames": frames, "fps": workflow.FPS,
-               "seconds": p["seconds"], "seed": p["seed"], "steps": p["steps"], "mode": rewrite.mode_of(first, last),
+        out = {"video_key": key, "video_url": video_url, "bytes": nbytes, "width": w, "height": h, "frames": frames,
+               "fps": workflow.FPS, "seconds": p["seconds"], "seed": p["seed"], "steps": p["steps"], "mode": mode,
                "prompt": prompt, "rewrite": rw, "timing": timing, "build": BUILD,
                "worker": {"jobs": _state["jobs"], "comfy_ready_s": _state["comfy_ready_s"], "prefetch_s": _state["prefetch_s"],
                           "vram_used_mib": vram_used_mib(), "mem_mib": container_mem_mib(), "mem": MEM.report(since=_state["job_t"])}}
-        log("job ok", job=jid, **{k: v for k, v in out.items() if k != "prompt"})
+        if mode == "ref2v":
+            out["refs"] = {"images": [im.size for im in ref_images], "videos": [info for _, info in ref_videos],
+                           "video_audio": p["ref_video_audio"]}
+        log("job ok", job=jid, **{k: v for k, v in out.items() if k not in ("prompt", "video_url")})   # the link is a credential
         return out
     except BadInput as e:
         log("job rejected", job=jid, error=str(e))

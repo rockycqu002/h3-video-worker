@@ -2,6 +2,8 @@
 """Live smoke test against a RunPod endpoint: submit via /run, poll /status, print the result and wall-clock timing.
 
   python tests/smoke.py --endpoint <id> t2v|i2v|fl2v|skip [--seconds 5] [--frames-base https://raw.githubusercontent.com/<owner>/<repo>/<sha>/tests/data]
+  python tests/smoke.py --endpoint <id> ref2v --ref-image <url> [--ref-image <url> ...] [--ref-video <url> [--ref-video-audio]]
+                        [--request-file prompt.txt] [--aspect 9:16] [--seconds 10]
 
 The API key comes from $RUNPOD_API_KEY or ~/.config/runpod/api_key and is never printed.
 """
@@ -18,6 +20,14 @@ CASES = {
              "request": "integrated_multimodal_description: [Shot 1] A close-up of a white ceramic cup on a wooden café counter; steam rises "
                         "slowly while morning light moves across the grain.\n\noverall_soundscape: soft café ambience, a distant espresso "
                         "machine hiss.\n\nnon_diegetic_music: gentle acoustic guitar."},
+    # Ref2VA: references come from --ref-image / --ref-video; pass a real six-section prompt with --request-file
+    "ref2v": {"skip_rewrite": True,
+              "request": "subject_definitions:\n<Subject 1> is the person in <Picture 1>.\n\nsummary:\n[reference generation] <Subject 1> "
+                         "smiles and waves at the camera in a sunlit café.\n\nretention_analysis:\n<Subject 1> (appears in [Shot 1]): "
+                         "fully_preserved - the face, hair and clothes from <Picture 1> are kept.\n\ndetailed_description:\nThe target "
+                         "video is photorealistic with warm morning light.\n[Shot 1] A medium shot of <Subject 1>, the person from "
+                         "<Picture 1>, standing at a café counter; they look into the camera, smile and wave once.\n\n"
+                         "overall_soundscape:\nSoft café ambience.\n\nnon_diegetic_music:\nGentle acoustic guitar."},
 }
 
 
@@ -37,8 +47,18 @@ def main():
     ap.add_argument("--endpoint", required=True); ap.add_argument("case", choices=list(CASES))
     ap.add_argument("--seconds", type=float, default=5); ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--frames-base"); ap.add_argument("--timeout", type=float, default=1200)
+    ap.add_argument("--ref-image", action="append", default=[]); ap.add_argument("--ref-video", action="append", default=[])
+    ap.add_argument("--ref-video-audio", action="store_true"); ap.add_argument("--request-file"); ap.add_argument("--aspect")
     a = ap.parse_args()
     inp = {**CASES[a.case], "seconds": a.seconds, "seed": a.seed}
+    if a.request_file:
+        inp["request"] = open(a.request_file).read()
+    if a.aspect:
+        inp["aspect"] = a.aspect
+    if a.case == "ref2v":
+        if not (a.ref_image or a.ref_video):
+            sys.exit("ref2v needs --ref-image and/or --ref-video")
+        inp.update(ref_image_urls=a.ref_image, ref_video_urls=a.ref_video, ref_video_audio=a.ref_video_audio)
     if a.case in ("i2v", "fl2v"):
         if not a.frames_base:
             sys.exit("--frames-base is required for keyframe cases")

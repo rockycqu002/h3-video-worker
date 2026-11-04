@@ -57,9 +57,15 @@ Content-Type: application/json
 | `input.steps` | 否 | int | `8` | 6–12。DaSiWa 为 8 步蒸馏模型，**保持默认** |
 | `input.first_frame_url` | 否 | string | — | 首帧图片的 **https** URL（见 §6） |
 | `input.last_frame_url` | 否 | string | — | 尾帧图片的 **https** URL |
+| `input.ref_image_urls` | 否 | string[] | — | v0.2.0+，Ref2VA 参考图，≤ 9 张，按顺序对应 prompt 里的 `<Picture 1>`…（见 §6.1） |
+| `input.ref_video_urls` | 否 | string[] | — | v0.2.0+，Ref2VA 参考视频，≤ 3 条，**24 fps、2–15 s**，按顺序对应 `<Video 1>`… |
+| `input.ref_video_audio` | 否 | bool | `false` | v0.2.0+，参考视频的音轨也作为参考（每条视频的音轨是 `<Audio k>`，排在对应 `<Video k>` 前） |
 | `webhook` | 建议 | string | — | 任务结束（成功或失败）时 RunPod 向该地址 POST 结果（见 §5） |
 
-模式由关键帧自动决定：无图 = T2V；只有首帧 = I2V；只有尾帧 = L2V；首尾都有 = FL2V。
+模式由输入自动决定：无图 = T2V；只有首帧 = I2V；只有尾帧 = L2V；首尾都有 = FL2V；有参考图 / 参考视频 = Ref2VA（`mode=ref2v`）。
+Ref2VA 不能与首尾帧同时用，且**必须 `skip_rewrite=true`**：`request` 直接写官方 full-reference 六段格式
+（`subject_definitions` / `summary` / `retention_analysis` / `detailed_description` / `overall_soundscape` / `non_diegetic_music`，
+见 MiniMax-H3 `h3-prompt-writing` skill 的 `references/ref-en.txt`）；自动改写暂不支持这个格式。
 未知字段被忽略。响应（HTTP 200）：`{"id": "6e9a7b15-…-u1", "status": "IN_QUEUE"}` —— **这个 `id` 就是 job_id，务必落库**，
 视频 key 由它决定（`videos/<job_id>.mp4`）。
 
@@ -105,6 +111,8 @@ Content-Type: application/json
 | 字段 | 用途 |
 |---|---|
 | `video_key` | R2 bucket `h3-videos` 里的对象 key。mp4（H.264 视频 + 32 kHz 立体声 AAC） |
+| `video_url` | v0.2.0+，该对象的预签名 GET 链接（默认 6 小时，`H3_VIDEO_URL_TTL_S`），给没有 R2 凭据的调用方下载用。是凭据，不要写日志 / 下发给浏览器 |
+| `refs` | 仅 Ref2VA：参考图尺寸、参考视频探测结果（宽高 / fps / 时长 / 是否有音轨）、`video_audio` |
 | `prompt` | 实际送进模型的最终 prompt。建议落库（复现、排查、二次编辑） |
 | `rewrite.engine` | `openh3ir`（T2V/I2V/L2V 默认）/ `skill`（FL2V，或 openh3ir 失败时的回退）/ `none`（skip_rewrite） |
 | `seed` | 同 seed + 同 prompt + 同关键帧可复现 |
@@ -169,12 +177,26 @@ worker 只从白名单域名下载关键帧，当前白名单：`21c38efd61d6ef0
 - 预签名需要 S3 凭据（R2 binding 本身不能签名）。建议为 Worker 单独建一个 **h3-videos 只读** 的 R2 token
   （签 GET 只需要读权限；写入用 binding），不要复用 RunPod 那把读写 token。
 
+### 6.1 Ref2VA 参考图 / 参考视频（v0.2.0+）
+
+与关键帧同一白名单（`FRAME_URL_ALLOW`）、同样只接 https、不跟随重定向。
+
+- 参考图：规则同关键帧（JPEG / PNG / WebP，≤ 16 MiB，≤ 50 MP），但**不裁剪**、保持原比例，长边超过 2048 时等比缩小
+  （节点按生成画面的像素面积再缩放，ComfyUI `ref_image_size=match`）。
+- 参考视频：≤ 64 MiB；worker 用 PyAV 探测并解第一帧，要求 **23.5–24.5 fps**（节点按 24 fps 读帧，不做重采样）、
+  时长 2–15 s、单帧 ≤ 1920×1920 像素；`ref_video_audio=true` 时必须有音轨。不满足即 `bad_input`。
+  - 长于输出的部分被节点截掉；想覆盖整条输出，模板长度取输出帧数（10 s → 243 帧 ≈ 10.13 s）。
+  - 参考视频的帧会和输出一起参与每一步采样，**分辨率越高越慢**。比输出小的参考视频按原尺寸使用（不放大），
+    模板建议预先缩到输出的一半边长（如 768×1344 输出用 384×672）。宽高不是 32 的倍数时节点会拉伸到最近的 32 倍数。
+- `aspect=auto` 时画布跟随第一条参考视频，没有视频则跟随第一张参考图。
+
 ## 7. 交付视频
 
 bucket `h3-videos` 不公开。两种方式：
 
 1. **Worker 代理**：`env.H3_VIDEOS.get(video_key)`，把 body 流式返回给用户，自己做鉴权（推荐，可控、可计量）。
 2. **预签名 GET**：给用户一个短期（如 1 小时）的下载链接。
+3. **服务端转存**（v0.2.0+，没有 R2 凭据的后端，如 gw）：用 `output.video_url` 下载后存进自己的存储。
 
 视频和关键帧建议配 R2 生命周期规则按天数自动删除（天数待定）。
 

@@ -1,7 +1,7 @@
 # h3-video-worker
 
-RunPod Serverless worker: **MiniMax H3** text / keyframe → video with stereo audio (768p, 24 fps, 4–15 s), using the
-community **DaSiWa Hybrid 8-step** checkpoint (Turbo baked in) on **RTX 4090 / CUDA 13**, served through headless ComfyUI.
+RunPod Serverless worker: **MiniMax H3** text / keyframe / reference (Ref2VA: images + template videos) → video with stereo
+audio (768p, 24 fps, 4–15 s), using the community **DaSiWa Hybrid 8-step** checkpoint (Turbo baked in, FL2VA and Ref2VA in one file) on **RTX 4090 / CUDA 13**, served through headless ComfyUI.
 Prompt expansion (open-h3-ir, with the official `h3-prompt-writing` skill as fallback) runs inside the worker; videos go
 to Cloudflare R2. The caller is a Cloudflare Worker. Design and decisions: [`docs/PLAN.md`](docs/PLAN.md). Caller guide: [`docs/API_CALLER.md`](docs/API_CALLER.md). Test report: [`docs/TEST_REPORT.md`](docs/TEST_REPORT.md).
 
@@ -42,7 +42,8 @@ POST https://api.runpod.ai/v2/<ENDPOINT_ID>/run
 | `OPENROUTER_MODEL` | default `qwen/qwen3-vl-235b-a22b-instruct` |
 | `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | output bucket; token scoped to that bucket (secrets) |
 | `R2_PREFIX` | default `videos` |
-| `FRAME_URL_ALLOW` | comma-separated keyframe hosts; `.example.com` also matches subdomains |
+| `FRAME_URL_ALLOW` | comma-separated hosts for keyframes and Ref2VA references; `.example.com` also matches subdomains |
+| `H3_VIDEO_URL_TTL_S` | lifetime of `output.video_url` (presigned GET), default 21600 |
 | `H3_COMFY_ARGS` | ComfyUI flags, default `--reserve-vram 1 --disable-nvml-pressure --fast-disk` (`--fast-disk` is required on RunPod 4090s: 43.9 GB RAM limit) |
 | `H3_JOB_DEADLINE_S` | default 1740 (endpoint executionTimeout 1800 s) |
 | `H3_PREFETCH` | `1` (default) reads the weights into the page cache at boot |

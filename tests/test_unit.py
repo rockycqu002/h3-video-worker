@@ -213,6 +213,7 @@ def stubbed(monkeypatch, tmp_path):
     def upload(path, key):
         state["uploaded"] = key; return 3
     monkeypatch.setattr(storage, "upload_video", upload)
+    monkeypatch.setattr(storage, "presign_video", lambda key, seconds: f"https://r2.example/{key}?sig=1")
     monkeypatch.setattr(rewrite, "rewrite", lambda *a, **k: {"prompt": "REWRITTEN", "engine": "openh3ir", "status": "ok",
                                                               "fallback_reason": None, "warnings": [], "tokens": 1, "seconds": 2.0})
     return state
@@ -227,6 +228,7 @@ def test_handler_happy_path(stubbed):
     assert stubbed["graph"]["cond"]["inputs"]["prompt"] == "REWRITTEN"
     assert stubbed["graph"]["img_first"]["inputs"]["image"] == "job-1_first.png"
     assert out["timing"]["generate"] == 190.0
+    assert out["video_url"] == "https://r2.example/videos/job-1.mp4?sig=1" and "refs" not in out
 
 
 def test_handler_skip_rewrite(stubbed, monkeypatch):
@@ -265,6 +267,143 @@ def test_handler_upload_failure(stubbed, monkeypatch):
 def test_handler_models_missing(stubbed):
     h._state["models_missing"] = ["vae/x.safetensors"]
     assert "model files missing" in h.handler({"id": "j7", "input": {"request": "a"}})["error"]
+
+
+# ----------------------------------------------------------------------------- Ref2VA (v0.2.0)
+def make_video(path, seconds=2.5, fps=24, size=(96, 160), audio=False):
+    """Tiny real mp4 through PyAV (no numpy needed): solid frames, optional silent AAC track."""
+    import fractions
+    av = pytest.importorskip("av")
+    with av.open(str(path), "w") as c:
+        v = c.add_stream("libx264" if "libx264" in av.codecs_available else "mpeg4", rate=fps)
+        v.width, v.height, v.pix_fmt = size[0], size[1], "yuv420p"
+        a = c.add_stream("aac", rate=32000) if audio else None
+        if a is not None:
+            a.layout = "mono"
+        for i in range(int(round(seconds * fps))):
+            for pkt in v.encode(av.VideoFrame.from_image(Image.new("RGB", size, (i * 9 % 255, 40, 90)))):
+                c.mux(pkt)
+        for pkt in v.encode():
+            c.mux(pkt)
+        if a is not None:
+            for start in range(0, int(seconds * 32000), 1024):
+                fr = av.AudioFrame(format="fltp", layout="mono", samples=1024)
+                for plane in fr.planes:
+                    plane.update(bytes(plane.buffer_size))
+                fr.sample_rate, fr.pts, fr.time_base = 32000, start, fractions.Fraction(1, 32000)
+                for pkt in a.encode(fr):
+                    c.mux(pkt)
+            for pkt in a.encode():
+                c.mux(pkt)
+    return str(path)
+
+
+def test_graph_reference():
+    g = workflow.build("P", 768, 1344, 10, 3, 8, "job/r", ref_images=["a.png", "b.png"], ref_videos=["t.mp4"], ref_video_audio=True)
+    cond = g["cond"]
+    assert cond["class_type"] == "MiniMaxH3ReferenceToVideo"
+    i = cond["inputs"]
+    assert (i["prompt"], i["width"], i["height"], i["length"]) == ("P", 768, 1344, 243) and i["ref_image_size"] == "match"
+    assert i["clip"] == ["clip", 0] and i["vae"] == ["vae_v", 0] and i["audio_vae"] == ["vae_a", 0]
+    assert i["ref_images.ref_image_0"] == ["ref_img_0", 0] and g["ref_img_1"]["inputs"]["image"] == "b.png"
+    assert g["ref_vid_0"] == {"class_type": "LoadVideo", "inputs": {"file": "t.mp4"}}
+    assert i["ref_videos.ref_video_0"] == ["ref_vid_0_parts", 0] and i["ref_video_audios.ref_video_audio_0"] == ["ref_vid_0_parts", 1]
+    assert "first_frame" not in i and "img_first" not in g
+    # downstream wiring is the shared template's: positive = output 0, AV latent = output 1
+    assert g["guider"]["inputs"]["conditioning"] == ["cond", 0] and g["sample"]["inputs"]["latent_image"] == ["cond", 1]
+    g = workflow.build("P", 768, 1344, 10, 3, 8, "job/r", ref_videos=["t.mp4"])
+    assert not any(k.startswith("ref_video_audios.") for k in g["cond"]["inputs"]) and "ref_img_0" not in g
+    with pytest.raises(ValueError):
+        workflow.build("P", 768, 1344, 10, 3, 8, "job/r", "f.png", ref_images=["a.png"])
+    assert workflow.template()["cond"]["class_type"] == "MiniMaxH3ImageToVideo"
+
+
+def test_fit_reference_caps_long_edge_only():
+    assert workflow.fit_reference(Image.new("RGB", (1200, 1600))).size == (1200, 1600)
+    assert workflow.fit_reference(Image.new("RGB", (3000, 4000))).size == (1536, 2048)
+
+
+def test_parse_refs():
+    p = h.parse_input({"request": "P", "skip_rewrite": True, "ref_image_urls": ["https://x/a.png"],
+                       "ref_video_urls": ["https://x/t.mp4"], "ref_video_audio": True})
+    assert p["ref_image_urls"] == ["https://x/a.png"] and p["ref_video_urls"] == ["https://x/t.mp4"] and p["ref_video_audio"] is True
+    p = h.parse_input({"request": "P"})
+    assert p["ref_image_urls"] == [] and p["ref_video_urls"] == [] and p["ref_video_audio"] is False
+
+
+@pytest.mark.parametrize("extra", [
+    {"ref_image_urls": ["https://x/a.png"]},                                                   # Ref2VA needs skip_rewrite
+    {"skip_rewrite": True, "ref_image_urls": "https://x/a.png"},                               # not a list
+    {"skip_rewrite": True, "ref_image_urls": ["https://x/a.png", ""]},
+    {"skip_rewrite": True, "ref_image_urls": [f"https://x/{i}.png" for i in range(10)]},       # > 9
+    {"skip_rewrite": True, "ref_video_urls": [f"https://x/{i}.mp4" for i in range(4)]},        # > 3
+    {"skip_rewrite": True, "ref_video_audio": True},                                          # audio without a video
+    {"skip_rewrite": True, "ref_video_urls": ["https://x/t.mp4"], "ref_video_audio": "yes"},
+    {"skip_rewrite": True, "ref_image_urls": ["https://x/a.png"], "first_frame_url": "https://x/f.png"},
+])
+def test_parse_refs_rejects(extra):
+    with pytest.raises(storage.BadInput):
+        h.parse_input({"request": "P", **extra})
+
+
+def test_canvas_auto_follows_reference_ratio():
+    p = h.parse_input({"request": "x"})
+    assert h.canvas(p, None, None, 9 / 16) == (768, 1344)
+    assert h.canvas(p, Image.new("RGB", (1600, 900)), None, 9 / 16) == (1344, 768)   # a keyframe still wins
+    assert h.canvas(h.parse_input({"request": "x", "aspect": "1:1"}), None, None, 9 / 16) == (768, 768)
+
+
+def test_probe_video(tmp_path):
+    info = storage.probe_video("v", make_video(tmp_path / "a.mp4"))
+    assert (info["width"], info["height"], info["fps"], info["audio"]) == (96, 160, 24.0, False) and 2.4 <= info["seconds"] <= 2.6
+    assert storage.probe_video("v", make_video(tmp_path / "b.mp4", audio=True), need_audio=True)["audio"] is True
+    for path, kw in ((make_video(tmp_path / "c.mp4", fps=30), {}),                 # wrong frame rate
+                     (make_video(tmp_path / "d.mp4", seconds=1), {}),              # too short
+                     (str(tmp_path / "a.mp4"), {"need_audio": True})):              # no soundtrack to use
+        with pytest.raises(storage.BadInput):
+            storage.probe_video("v", path, **kw)
+    (tmp_path / "e.mp4").write_bytes(b"\0" * 2048)
+    with pytest.raises(storage.BadInput):
+        storage.probe_video("v", str(tmp_path / "e.mp4"))
+
+
+def test_fetch_video_rejects_before_network(monkeypatch, tmp_path):
+    monkeypatch.setenv("FRAME_URL_ALLOW", "frames.example.com")
+    monkeypatch.setattr(storage.requests, "get", lambda *a, **k: pytest.fail("must not fetch"))
+    with pytest.raises(storage.BadInput):
+        storage.fetch_video("ref_video_urls[0]", "https://evil.com/t.mp4", str(tmp_path / "t.mp4"))
+
+
+def test_handler_ref2v(stubbed, monkeypatch, tmp_path):
+    monkeypatch.setattr(storage, "fetch_image", lambda field, url: Image.new("RGB", (3000, 4000), (9, 9, 9)))
+    fetched = []
+
+    def fetch_video(field, url, dest, need_audio=False):
+        fetched.append((field, url, dest, need_audio))
+        open(dest, "wb").write(b"mp4")
+        return {"width": 432, "height": 768, "fps": 24.0, "seconds": 10.13, "audio": True}
+    monkeypatch.setattr(storage, "fetch_video", fetch_video)
+    monkeypatch.setattr(rewrite, "rewrite", lambda *a, **k: pytest.fail("Ref2VA must not rewrite"))
+    out = h.handler({"id": "r1", "input": {"request": "SIX SECTIONS", "skip_rewrite": True, "seconds": 10,
+                                           "ref_image_urls": ["https://x/lead.jpg", "https://x/sax.jpg"],
+                                           "ref_video_urls": ["https://x/template.mp4"], "ref_video_audio": True}})
+    assert "error" not in out, out
+    assert out["mode"] == "ref2v" and (out["width"], out["height"]) == (768, 1344)   # "auto" follows the template video
+    assert out["refs"] == {"images": [(1536, 2048), (1536, 2048)], "video_audio": True,
+                           "videos": [{"width": 432, "height": 768, "fps": 24.0, "seconds": 10.13, "audio": True}]}
+    assert fetched[0][0] == "ref_video_urls[0]" and fetched[0][2].endswith("r1_ref_video_0.mp4") and fetched[0][3] is True
+    g = stubbed["graph"]
+    assert g["cond"]["class_type"] == "MiniMaxH3ReferenceToVideo" and g["cond"]["inputs"]["prompt"] == "SIX SECTIONS"
+    assert g["ref_img_1"]["inputs"]["image"] == "r1_ref_image_1.png" and g["ref_vid_0"]["inputs"]["file"] == "r1_ref_video_0.mp4"
+    assert not list(tmp_path.glob("r1_*"))                   # inputs are cleaned up after the job
+
+
+def test_handler_ref2v_bad_video_is_bad_input(stubbed, monkeypatch):
+    def fetch_video(field, url, dest, need_audio=False):
+        raise storage.BadInput(f"{field} 帧率 30.000 不是 24 fps")
+    monkeypatch.setattr(storage, "fetch_video", fetch_video)
+    out = h.handler({"id": "r2", "input": {"request": "P", "skip_rewrite": True, "ref_video_urls": ["https://x/t.mp4"]}})
+    assert out["error"].startswith("bad_input: ref_video_urls[0] 帧率")
 
 
 # ----------------------------------------------------------------------------- ComfyUI liveness (v0.1.2)
