@@ -66,7 +66,14 @@ def main():
         if a.case == "fl2v":
             inp["last_frame_url"] = f"{a.frames_base}/last.jpg"
     t0 = time.time()
-    job = req("POST", f"{API}/{a.endpoint}/run", {"input": inp})
+    for delay in (2, 5, 15, 30, None):     # 409 (endpoint updating, e.g. right after a scaling change) / 429 / 5xx: not accepted
+        try:
+            job = req("POST", f"{API}/{a.endpoint}/run", {"input": inp})
+            break
+        except urllib.error.HTTPError as e:
+            if delay is None or not (e.code in (409, 429) or e.code >= 500):
+                raise
+            print(f"  /run HTTP {e.code}, retrying in {delay}s", flush=True); time.sleep(delay)
     jid = job["id"]; print(f"[{a.case}] job {jid} submitted", flush=True)
     last = None
     while time.time() - t0 < a.timeout:
