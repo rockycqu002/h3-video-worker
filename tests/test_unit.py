@@ -438,6 +438,21 @@ def test_run_graph_tolerates_slow_http(monkeypatch):
     assert path.endswith("job/job_x.mp4") and calls["n"] == 4
 
 
+def test_run_graph_skips_load_video_preview(monkeypatch):
+    """Ref2VA: LoadVideo lists its input file as a preview; that is not the result (v0.2.0 uploaded the wrong path)."""
+    monkeypatch.setattr(h, "_procs", {"comfy": FakeProc()})
+    monkeypatch.setattr(h.time, "sleep", lambda s: None)
+    history = {"p1": {"status": {"status_str": "success"}, "outputs": {
+        "ref_vid_0": {"images": [{"filename": "j_ref_video_0.mp4", "subfolder": "", "type": "input"}], "animated": [True]},
+        "save": {"images": [{"filename": "j_00001_.mp4", "subfolder": "job", "type": "output"}], "animated": [True]}}}}
+    monkeypatch.setattr(h, "comfy", lambda path, body=None, timeout=60: {"prompt_id": "p1"} if path == "/prompt" else history)
+    path, _ = h.run_graph({}, {}, h.time.time() + 600)
+    assert path == os.path.join(h.OUT_DIR, "job", "j_00001_.mp4")
+    del history["p1"]["outputs"]["save"]
+    with pytest.raises(h.JobError):
+        h.run_graph({}, {}, h.time.time() + 600)
+
+
 def test_run_graph_sigkill_is_oom(monkeypatch):
     proc = FakeProc()
     monkeypatch.setattr(h, "_procs", {"comfy": proc})

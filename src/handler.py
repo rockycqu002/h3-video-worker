@@ -441,9 +441,12 @@ def run_graph(job, graph, deadline):
     st = h[pid].get("status", {})
     if st.get("status_str") != "success":
         raise execution_error(st)
-    for node in h[pid].get("outputs", {}).values():
-        for item in node.get("images", []) + node.get("gifs", []) + node.get("videos", []):
-            if item.get("filename", "").endswith(".mp4"):
+    # only files SaveVideo wrote (type "output"): LoadVideo also lists its input file as a preview (type "input", Ref2VA)
+    outputs = h[pid].get("outputs", {})
+    for node in sorted(outputs, key=lambda n: n != "save"):        # the "save" node first
+        o = outputs[node]
+        for item in o.get("images", []) + o.get("gifs", []) + o.get("videos", []):
+            if item.get("filename", "").endswith(".mp4") and item.get("type", "output") == "output":
                 return os.path.join(OUT_DIR, item.get("subfolder", ""), item["filename"]), time.time() - t0
     raise JobError("comfy_rejected", "ComfyUI produced no mp4")
 
